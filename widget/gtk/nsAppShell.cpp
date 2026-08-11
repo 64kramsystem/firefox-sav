@@ -6,12 +6,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <iterator>
 #include <gdk/gdk.h>
 #include "nsAppShell.h"
 #include "nsBaseAppShell.h"
 #include "nsWindow.h"
 #include "mozilla/Logging.h"
 #include "prenv.h"
+#include "mozilla/Atomics.h"
 #include "mozilla/BackgroundHangMonitor.h"
 #include "mozilla/Hal.h"
 #include "mozilla/ProfilerLabels.h"
@@ -65,6 +67,12 @@ LazyLogModule gWidgetCompositorLog("WidgetCompositor");
 static GPollFunc sPollFunc;
 
 nsAppShell* nsAppShell::sAppShell = nullptr;
+static bool sInstallQuitSignalHandlers;
+static Atomic<int, Relaxed> sQuitPipeFD(-1);
+
+static constexpr int kQuitSignals[] = {SIGHUP, SIGINT, SIGTERM};
+static struct sigaction sPreviousQuitSignalActions[std::size(kQuitSignals)];
+static bool sQuitSignalHandlerInstalled[std::size(kQuitSignals)];
 
 // Wrapper function to disable hang monitoring while waiting in poll().
 static gint PollWrapper(GPollFD* aUfds, guint aNfsd, gint aTimeout) {
@@ -167,6 +175,8 @@ gboolean nsAppShell::EventProcessorCallback(GIOChannel* source,
 }
 
 nsAppShell::~nsAppShell() {
+  sQuitPipeFD = -1;
+  RestoreQuitSignalHandlers();
   sAppShell = nullptr;
 
 #ifdef MOZ_ENABLE_DBUS
@@ -422,36 +432,86 @@ void nsAppShell::StopDBusListening() {
 }
 #endif
 
-void nsAppShell::TermSignalHandler(int signo) {
-  if (signo != SIGTERM) {
-    NS_WARNING("Wrong signal!");
-    return;
+void nsAppShell::QuitSignalHandler(int signo) {
+  switch (signo) {
+    case SIGHUP:
+    case SIGINT:
+    case SIGTERM:
+      break;
+    default:
+      return;
   }
-  sAppShell->ScheduleQuitEvent();
+
+  int pipeFD = sQuitPipeFD;
+  if (pipeFD != -1) {
+    unsigned char buf[] = {QUIT_TOKEN};
+    [[maybe_unused]] ssize_t result = write(pipeFD, buf, 1);
+  }
 }
 
-void nsAppShell::InstallTermSignalHandler() {
-  if (!XRE_IsParentProcess() || PR_GetEnv("MOZ_DISABLE_SIG_HANDLER") ||
-      !sAppShell) {
+void nsAppShell::InstallQuitSignalHandlers() {
+  if (!XRE_IsParentProcess() || PR_GetEnv("MOZ_DISABLE_SIG_HANDLER")) {
     return;
   }
 
-  struct sigaction act = {}, oldact;
-  act.sa_handler = TermSignalHandler;
+  // XRE requests the handlers before the native app shell is normally
+  // constructed. Remember that request and fulfill it from Init().
+  sInstallQuitSignalHandlers = true;
+  if (!sAppShell) {
+    return;
+  }
+
+  struct sigaction act = {};
+  act.sa_handler = QuitSignalHandler;
   sigfillset(&act.sa_mask);
 
-  if (NS_WARN_IF(sigaction(SIGTERM, nullptr, &oldact) != 0)) {
-    return;
-  }
-  if (oldact.sa_handler != SIG_DFL) {
-    NS_WARNING("SIGTERM signal handler is already set?");
-  }
+  for (size_t index = 0; index < std::size(kQuitSignals); ++index) {
+    if (sQuitSignalHandlerInstalled[index]) {
+      continue;
+    }
 
-  sigaction(SIGTERM, &act, nullptr);
+    const int signal = kQuitSignals[index];
+    struct sigaction oldact;
+    if (NS_WARN_IF(sigaction(signal, nullptr, &oldact) != 0)) {
+      continue;
+    }
+
+    // Applications commonly inherit SIGHUP or SIGINT as ignored when they are
+    // launched by a shell. POSIX requires that ignored dispositions survive
+    // exec, so preserve them.
+    if (oldact.sa_handler == SIG_IGN) {
+      continue;
+    }
+
+    if (NS_WARN_IF(sigaction(signal, &act, nullptr) != 0)) {
+      continue;
+    }
+    sPreviousQuitSignalActions[index] = oldact;
+    sQuitSignalHandlerInstalled[index] = true;
+  }
+}
+
+void nsAppShell::RestoreQuitSignalHandlers() {
+  for (size_t index = 0; index < std::size(kQuitSignals); ++index) {
+    if (!sQuitSignalHandlerInstalled[index]) {
+      continue;
+    }
+
+    const int signal = kQuitSignals[index];
+    struct sigaction current;
+    if (!NS_WARN_IF(sigaction(signal, nullptr, &current) != 0) &&
+        current.sa_handler == QuitSignalHandler) {
+      NS_WARN_IF(sigaction(signal, &sPreviousQuitSignalActions[index],
+                           nullptr) != 0);
+    }
+    sQuitSignalHandlerInstalled[index] = false;
+  }
 }
 
 nsresult nsAppShell::Init() {
   MOZ_ASSERT(!sAppShell);
+  nsresult rv;
+
   mozilla::hal::Init();
 
 #ifdef MOZ_ENABLE_DBUS
@@ -559,7 +619,14 @@ nsresult nsAppShell::Init() {
 
   sAppShell = this;
 
-  return nsBaseAppShell::Init();
+  rv = nsBaseAppShell::Init();
+  if (NS_SUCCEEDED(rv)) {
+    sQuitPipeFD = mPipeFDs[1];
+    if (sInstallQuitSignalHandlers) {
+      InstallQuitSignalHandlers();
+    }
+  }
+  return rv;
 failed:
   close(mPipeFDs[0]);
   close(mPipeFDs[1]);
@@ -582,11 +649,6 @@ NS_IMETHODIMP nsAppShell::Run() {
 
 void nsAppShell::ScheduleNativeEventCallback() {
   unsigned char buf[] = {NOTIFY_TOKEN};
-  [[maybe_unused]] ssize_t _ = write(mPipeFDs[1], buf, 1);
-}
-
-void nsAppShell::ScheduleQuitEvent() {
-  unsigned char buf[] = {QUIT_TOKEN};
   [[maybe_unused]] ssize_t _ = write(mPipeFDs[1], buf, 1);
 }
 

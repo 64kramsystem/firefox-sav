@@ -2,6 +2,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+import os
+import signal
 import sys
 import unittest
 from urllib.parse import quote
@@ -15,6 +17,17 @@ from marionette_harness import MarionetteTestCase
 
 def inline(doc):
     return "data:text/html;charset=utf-8,{}".format(quote(doc))
+
+
+SHUTDOWN_TOPICS = [
+    "quit-application-granted",
+    "quit-application",
+    "profile-change-net-teardown",
+    "profile-change-teardown",
+    "profile-before-change",
+    "xpcom-will-shutdown",
+    "xpcom-shutdown",
+]
 
 
 class TestServerQuitApplication(MarionetteTestCase):
@@ -129,6 +142,61 @@ class TestQuitRestart(MarionetteTestCase):
         """,
             script_args=(restart,),
         )
+
+    def install_shutdown_observer(self, marker_path):
+        with self.marionette.using_context("chrome"):
+            self.marionette.execute_script(
+                """
+                const file = Cc["@mozilla.org/file/local;1"].createInstance(
+                  Ci.nsIFile
+                );
+                file.initWithPath(arguments[0]);
+
+                const stream = Cc[
+                  "@mozilla.org/network/file-output-stream;1"
+                ].createInstance(Ci.nsIFileOutputStream);
+                stream.init(file, 0x02 | 0x08 | 0x20, 0o600, 0);
+
+                const observer = {
+                  observe(subject, topic) {
+                    const line = `${topic}\n`;
+                    stream.write(line, line.length);
+                    stream.flush();
+                  },
+                  QueryInterface: ChromeUtils.generateQI(["nsIObserver"]),
+                };
+
+                for (const topic of arguments[1]) {
+                  Services.obs.addObserver(observer, topic);
+                }
+                globalThis.shutdownSignalTestObserver = observer;
+                """,
+                script_args=(marker_path, SHUTDOWN_TOPICS),
+            )
+
+    @unittest.skipUnless(mozinfo.isLinux, "Only supported on Linux")
+    def test_unix_signals_trigger_normal_shutdown(self):
+        signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        for index, signum in enumerate(signals):
+            with self.subTest(signal=signal.Signals(signum).name):
+                if index:
+                    self.marionette.start_session()
+
+                marker_path = os.path.join(
+                    self.marionette.profile_path, f"shutdown-{signum}.log"
+                )
+                self.addCleanup(
+                    lambda path=marker_path: os.path.exists(path)
+                    and os.remove(path)
+                )
+                self.install_shutdown_observer(marker_path)
+
+                pid = self.marionette.process_id
+                self.marionette.quit(callback=lambda: os.kill(pid, signum))
+
+                self.assertEqual(self.marionette.instance.runner.returncode, 0)
+                with open(marker_path) as marker:
+                    self.assertEqual(marker.read().splitlines(), SHUTDOWN_TOPICS)
 
     def test_force_restart(self):
         self.marionette.restart(in_app=False)
