@@ -5762,7 +5762,7 @@ int XREMain::XRE_mainStartup(bool* aExitFlag,
     }
 #endif
 #ifdef MOZ_WIDGET_GTK
-    nsAppShell::InstallTermSignalHandler();
+    nsAppShell::InstallQuitSignalHandlers();
 #endif
   }
 

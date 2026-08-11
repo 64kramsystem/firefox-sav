@@ -55,7 +55,7 @@ class nsAppShell : public nsBaseAppShell {
   static void SetSystemDBus(GDBusConnection* aDBusConnectionSystem);
 #endif
 
-  static void InstallTermSignalHandler();
+  static void InstallQuitSignalHandlers();
 
  private:
   virtual ~nsAppShell();
@@ -64,9 +64,8 @@ class nsAppShell : public nsBaseAppShell {
                      const char16_t* aData) override;
   static gboolean EventProcessorCallback(GIOChannel* source,
                                          GIOCondition condition, gpointer data);
-  static void TermSignalHandler(int signo);
-
-  void ScheduleQuitEvent();
+  static void QuitSignalHandler(int signo);
+  static void RestoreQuitSignalHandlers();
 
   int mPipeFDs[2] = {0, 0};
   unsigned mTag = 0;
